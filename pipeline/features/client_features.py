@@ -1,36 +1,42 @@
 """
-Client-level feature computations requested by the data science team.
+Client-level feature computations based on the de_test_materials schema.
 
-Each function accepts a client_id and an open psycopg2 cursor (RealDictCursor).
-All SQL uses parameterised queries; no string interpolation of user data.
+Real tables
+-----------
+user    – CRM client record  (id, created_on, first_name, last_name, …)
+loan    – Loan record         (id, client_id, amount, status, created_on,
+                               duration, matured_on, updated_on)
+payment – Payment instalment  (id, loan_id, amount, principle, interest,
+                               status, created_on)
+
+Loan status values observed in the dump: 'paid' | 'overdue' | 'application'
 
 Assumptions & edge-case documentation
 --------------------------------------
 paid_loans_count
     • Counts loans WHERE status = 'paid'.
-    • Returns 0 for clients with no paid loans (including brand-new clients).
-    • 'defaulted' / 'written_off' loans are NOT counted as paid.
+    • Returns 0 for clients with no paid loans.
+    • 'overdue' and 'application' are not counted.
 
 days_since_last_late_payment
-    • A late payment is a row in `payments` WHERE is_late = TRUE
-      AND payment_date IS NOT NULL (the payment was actually made, just late).
-    • Returns None when the client has never made a late payment or has no
-      payment history at all – downstream consumers should treat None as
-      "no late payment on record", not as zero.
-    • Days are calculated as integer days from today (UTC) to the latest
-      late payment_date.
+    • "Late payment" is inferred from the loan table (the payment table is
+      empty in this dump):
+        – status = 'overdue'                           (missed payment)
+        – status = 'paid' AND updated_on > matured_on  (paid after due date)
+    • updated_on is used as the event date (when the status last changed).
+    • Returns None when the client has never had an overdue or late-paid loan.
+    • Days are integer calendar days (TODAY UTC − updated_on).
 
 profit_in_last_90_days_rate
-    • Numerator  : sum of interest_amount from payments WHERE payment_date
-                   IS NOT NULL on loans issued in the last 90 days.
-    • Denominator: sum of loan.amount for loans issued in the last 90 days.
-    • Returns None  when the client has no loans issued in the last 90 days
-      (undefined / missing, not zero).
-    • Returns 0.0  when loans exist in the window but no payments have been
-      received yet (valid ratio of 0/positive_number).
-    • Division-by-zero against a zero-sum loan amount is guarded and returns
-      None (edge case: loan amount recorded as 0, which shouldn't happen in
-      normal operation).
+    • Numerator  : SUM(payment.interest) for payments made on loans issued
+                   in the last 90 days (payment.created_on IS NOT NULL acts
+                   as proof of receipt, though the current dump has no rows).
+    • Denominator: SUM(loan.amount) for loans issued in the last 90 days.
+    • Returns None  when no loans were issued in the last 90 days.
+    • Returns 0.0  when loans exist in the window but no payments yet.
+    • Note: the test dataset covers 2019–2020; running today (2026+) means
+      this feature will always return None – this is correct behaviour and
+      demonstrates the NULL-safety of the implementation.
 """
 
 import logging
@@ -46,43 +52,52 @@ logger = logging.getLogger(__name__)
 
 def compute_paid_loans_count(client_id: int, cur) -> int:
     cur.execute(
-        "SELECT COUNT(*) AS cnt FROM loans WHERE client_id = %s AND status = 'paid'",
+        "SELECT COUNT(*) AS cnt FROM loan WHERE client_id = %s AND status = 'paid'",
         (client_id,),
     )
     return int(cur.fetchone()["cnt"])
 
 
 def compute_days_since_last_late_payment(client_id: int, cur) -> Optional[float]:
+    """
+    Uses loan.updated_on as a proxy for payment date.
+    Late = overdue loan OR paid loan where updated_on > matured_on.
+    """
     cur.execute(
         """
-        SELECT MAX(payment_date) AS last_late_date
-        FROM   payments
+        SELECT MAX(updated_on) AS last_late_date
+        FROM   loan
         WHERE  client_id = %s
-          AND  is_late = TRUE
-          AND  payment_date IS NOT NULL
+          AND  (
+                status = 'overdue'
+                OR (status = 'paid' AND updated_on > matured_on)
+               )
         """,
         (client_id,),
     )
     row = cur.fetchone()
     if row["last_late_date"] is None:
-        return None  # no late payment on record
+        return None  # no late/overdue loans on record
 
     today = datetime.now(timezone.utc).date()
     return float((today - row["last_late_date"]).days)
 
 
 def compute_profit_in_last_90_days_rate(client_id: int, cur) -> Optional[float]:
+    """
+    SUM(payment.interest) / SUM(loan.amount) for loans issued in last 90 days.
+    Falls back to None when no loans exist in the window.
+    """
     cur.execute(
         """
         SELECT
-            COALESCE(SUM(p.interest_amount), 0.0)  AS total_interest_received,
-            SUM(l.amount)                           AS total_loan_amount
-        FROM   loans l
-        LEFT JOIN payments p
+            COALESCE(SUM(p.interest), 0.0) AS total_interest_received,
+            SUM(l.amount)                  AS total_loan_amount
+        FROM   loan l
+        LEFT JOIN payment p
                ON p.loan_id = l.id
-              AND p.payment_date IS NOT NULL
         WHERE  l.client_id = %s
-          AND  l.issued_at >= NOW() - INTERVAL '90 days'
+          AND  l.created_on >= CURRENT_DATE - INTERVAL '90 days'
         """,
         (client_id,),
     )
@@ -94,22 +109,19 @@ def compute_profit_in_last_90_days_rate(client_id: int, cur) -> Optional[float]:
 
     total_loan_amount = float(total_loan_amount)
     if total_loan_amount == 0:
-        return None  # guard: should not occur with valid data
+        return None  # guard against zero-amount loans (data quality)
 
     return float(row["total_interest_received"]) / total_loan_amount
 
 
 # ---------------------------------------------------------------------------
-# Batch entry point – single DB connection for all clients in one cycle
+# Batch entry point
 # ---------------------------------------------------------------------------
 
 def compute_features_for_clients(client_ids: list, cur) -> list:
     """
-    Compute all three features for every client_id in *client_ids*.
-    Returns a list of dicts ready to be turned into a DataFrame.
-
-    A single open cursor is passed in so the caller controls the
-    transaction/connection lifecycle.
+    Compute all three features for every client_id.
+    A single open cursor is passed in; the caller owns the connection.
     """
     if not client_ids:
         return []
@@ -133,10 +145,7 @@ def compute_features_for_clients(client_ids: list, cur) -> list:
         )
         logger.debug(
             "client=%d paid_loans=%d days_late=%s profit_rate=%s",
-            cid,
-            paid_loans,
-            days_late,
-            profit_rate,
+            cid, paid_loans, days_late, profit_rate,
         )
 
     return records

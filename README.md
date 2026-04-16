@@ -1,8 +1,8 @@
 # Creditstar Data Engineer Test – Streaming Feature Pipeline
 
 A near-real-time pipeline that detects changed rows in a PostgreSQL CRM
-replica, computes client-level features, and writes raw data + features to
-MinIO (S3-compatible object storage) as Parquet files.
+replica (`de_test_materials`), computes client-level features, and writes raw
+data + features to MinIO (S3-compatible object storage) as Parquet files.
 
 ---
 
@@ -15,7 +15,7 @@ git clone <this-repo> && cd creditstar-test
 # 2. Copy env template (defaults work out of the box)
 cp .env.example .env
 
-# 3. Start all services
+# 3. Start all services  (first run restores the dump – takes ~30 s)
 docker compose up --build
 
 # 4. Watch pipeline logs
@@ -26,7 +26,7 @@ docker compose exec pipeline python scripts/simulate_changes.py
 ```
 
 **MinIO console** → http://localhost:9001 (minioadmin / minioadmin)  
-**PostgreSQL** → localhost:5432 / creditstar / postgres
+**PostgreSQL**    → localhost:5432 / de_test_materials / postgres
 
 ---
 
@@ -46,26 +46,27 @@ All 13 tests pass without a live database (mocked cursors).
 
 ```
 .
-├── docker-compose.yml          # Service orchestration
-├── .env.example                # Environment variable template
+├── docker-compose.yml
+├── .env.example
 ├── database/
-│   ├── 01_schema.sql           # Tables, indexes, triggers, watermark table
-│   └── 02_seed.sql             # Seed data covering all feature edge cases
+│   ├── de_test_task_db          # PostgreSQL custom-format dump (binary, ~6 MB)
+│   ├── 00_restore.sh            # Restores dump on first container start
+│   └── 01_pipeline_setup.sql    # Adds watermark table + indexes post-restore
 └── pipeline/
     ├── Dockerfile
     ├── requirements.txt
-    ├── config.py               # Config from env vars
-    ├── main.py                 # Entry point
-    ├── db/connector.py         # Postgres connection helpers
-    ├── storage/minio_client.py # MinIO / S3 write helpers
+    ├── config.py
+    ├── main.py
+    ├── db/connector.py
+    ├── storage/minio_client.py
     ├── features/
-    │   └── client_features.py  # Feature computation (Sub Task 2)
+    │   └── client_features.py   # Feature computation (Sub Task 2)
     ├── streaming/
-    │   └── pipeline.py         # CDC polling loop (Sub Task 1 + 2)
+    │   └── pipeline.py          # CDC polling loop (Sub Task 1 + 2)
     ├── scripts/
-    │   └── simulate_changes.py # Live demo helper
+    │   └── simulate_changes.py  # Live demo helper
     └── tests/
-        └── test_features.py    # 13 unit tests (no DB required)
+        └── test_features.py     # 13 unit tests (no DB required)
 ```
 
 ---
@@ -76,138 +77,143 @@ All 13 tests pass without a live database (mocked cursors).
 
 | Component | Choice | Reason |
 |-----------|--------|--------|
-| Source DB | PostgreSQL 15 | Requirement; `wal_level=logical` enabled for future true CDC |
-| Object storage | MinIO | S3-compatible, runs locally in Docker, zero cost |
-| Orchestration | Docker Compose | Reproducible one-command setup; no cloud account needed |
-| CDC mechanism | Timestamp polling | Simple, portable, survives container restarts via JSON watermarks |
-| Data format | Parquet (pyarrow) | Columnar, compressed, natively readable by Spark/Athena/DuckDB |
+| Source DB | PostgreSQL 15 + dump restore | The provided dump targets PostgreSQL |
+| Object storage | MinIO | S3-compatible, zero cost, runs locally in Docker |
+| Orchestration | Docker Compose | One-command reproducible setup |
+| CDC mechanism | Date-watermark polling | Simple, no extra infrastructure |
+| Output format | Parquet (pyarrow) | Columnar, compressed, works with Spark/Athena/DuckDB |
 
 ### Trade-offs considered
 
 **Polling vs Debezium**  
-Timestamp polling is operationally simple and has no schema dependencies, but
-it introduces latency equal to the poll interval (10 s by default) and cannot
-capture hard DELETEs. Debezium reading the WAL would be sub-second and
-capture all change types, but requires Kafka + Zookeeper + Kafka Connect,
-making local setup significantly heavier. Given that loan/payment records are
-never deleted in the CRM, missing DELETEs is acceptable here.
+The CRM schema uses DATE columns (`updated_on`, `created_on`) for tracking
+changes — day-level granularity.  Polling on these columns is simple and
+requires no schema migration.  A sub-second CDC solution (Debezium reading
+PostgreSQL WAL) would require adding TIMESTAMPTZ `updated_at` columns and
+setting up Kafka + Kafka Connect, which adds significant operational
+complexity for a local setup.
+
+**Date granularity**  
+Because `loan.updated_on` is a DATE (not TIMESTAMPTZ), the polling window
+is one calendar day.  If two updates happen on the same day and the second
+one falls after our watermark was advanced, it will be caught in the next
+cycle.  In practice this means ~day-level latency rather than the configured
+poll interval.  A proper migration adding `TIMESTAMPTZ updated_at` with a
+trigger would fix this.
 
 **MinIO vs cloud S3**  
-MinIO is API-compatible with AWS S3, so `storage/minio_client.py` works
-unchanged against real S3 by swapping the endpoint env var. This avoids
-cloud costs for local development while keeping production the same code
-path.
-
-**JSON watermarks vs DB-backed watermarks**  
-A JSON file on a Docker volume is simple and survives restarts. The
-`pipeline_watermarks` table in the schema was an alternative; I kept it in
-the schema for reference (useful if multiple pipeline replicas need
-coordination).
+`storage/minio_client.py` is S3 API-compatible.  Switching to AWS S3 in
+production is a one-line env-var change (`MINIO_ENDPOINT=s3.amazonaws.com`).
 
 ### With more time / budget
 
-1. **True CDC via Debezium** – Wire up a Debezium PostgreSQL connector into
-   Kafka. The Python consumer subscribes to the topic, which gives sub-second
-   latency, reliable DELETE capture, and a replayable event log.
+1. **Add TIMESTAMPTZ `updated_at` columns** – migrate `loan`, `payment`, `user`
+   to use proper timestamps so sub-minute CDC becomes possible.
 
-2. **Kafka as the transport layer** – Decouples ingestion from feature
-   computation. Multiple consumers (ML training jobs, real-time decision
-   engine, monitoring) can read the same topic independently.
+2. **Debezium + Kafka** – true WAL-based CDC; captures every row change
+   including hard deletes, sub-second latency, replayable event log.
 
-3. **Schema Registry + Avro/Protobuf** – Enforces schema evolution contracts
+3. **Schema Registry (Avro/Protobuf)** – enforce schema evolution contracts
    between producer and consumers.
 
-4. **Dedicated feature store** – Write computed features to Feast or Hopsworks
-   instead of raw Parquet so the decision engine can do point-in-time correct
-   lookups.
+4. **Feature store** (Feast / Hopsworks) – replace raw Parquet with a
+   point-in-time correct feature store so the decision engine can do
+   low-latency lookups during scoring.
 
-5. **Airflow / Prefect for orchestration** – Replace the `while True` loop
-   with a proper DAG that has retry logic, SLA alerting, and backfill support.
-
-6. **Partitioning strategy** – Partition by `client_id % N` buckets to make
-   downstream joins efficient at scale.
+5. **Airflow / Prefect** – replace the `while True` loop with a DAG that
+   provides retry logic, SLA alerting, and backfill.
 
 ---
 
 ## Sub Task 2 – Features
 
-All feature logic lives in `pipeline/features/client_features.py`.
+All logic is in `pipeline/features/client_features.py`.
 
-### Feature definitions
+### Real database schema (de_test_materials)
 
-#### `client.paid_loans.count`
+| Table | Key columns |
+|-------|-------------|
+| `user` | `id`, `created_on`, `first_name`, `last_name`, `birth_date`, `personal_code` |
+| `loan` | `id`, `client_id`, `amount`, `status` ('paid'\|'overdue'\|'application'), `created_on`, `duration`, `matured_on`, `updated_on` |
+| `payment` | `id`, `loan_id`, `amount`, `principle`, `interest`, `status`, `created_on` |
 
-```python
-SELECT COUNT(*) FROM loans
+---
+
+### `client.paid_loans.count`
+
+```sql
+SELECT COUNT(*) FROM loan
 WHERE client_id = %s AND status = 'paid'
 ```
 
 **Assumptions:**
-- Only loans with `status = 'paid'` count. `'defaulted'` and `'written_off'`
-  loans are not considered paid.
-- Returns `0` for clients with no history (brand-new clients).
+- Only `status = 'paid'` is counted.  `'overdue'` and `'application'` are excluded.
+- Returns `0` for clients with no paid loans.
 
 ---
 
-#### `client.days_since_last_late_payment.count`
+### `client.days_since_last_late_payment.count`
 
-```python
-SELECT MAX(payment_date)
-FROM   payments
+```sql
+SELECT MAX(updated_on) AS last_late_date
+FROM   loan
 WHERE  client_id = %s
-  AND  is_late = TRUE
-  AND  payment_date IS NOT NULL
+  AND  (
+        status = 'overdue'
+        OR (status = 'paid' AND updated_on > matured_on)
+       )
 ```
 
-Days = `today (UTC) − last_late_payment_date`.
+Days = `TODAY (UTC) − last_late_date`.
 
 **Assumptions:**
-- `is_late = TRUE AND payment_date IS NOT NULL` means the payment was
-  eventually made but after its due date. Scheduled future payments that are
-  not yet past due are excluded.
-- Returns `None` (null) when the client has no late payment on record.
-  Downstream consumers should treat `None` as "no late payment ever", not as
-  zero – a client with `days = None` is better than one with `days = 5000`.
-- Days are integer calendar days, not fractional.
+- The `payment` table is empty in this dump; late-payment information is
+  inferred from the `loan` table.
+- "Late" = loan went overdue (`status = 'overdue'`) OR loan was paid after
+  its maturity date (`status = 'paid' AND updated_on > matured_on`).
+- `loan.updated_on` is used as the event date (last status change).
+- Returns `None` when the client has no overdue or late-paid loans on record.
+  Downstream consumers should treat `None` as "no late payment ever", not zero.
 
 ---
 
-#### `client.profit_in_last_90_days.rate`
+### `client.profit_in_last_90_days.rate`
 
 ```sql
 SELECT
-    COALESCE(SUM(p.interest_amount), 0.0)  AS total_interest_received,
-    SUM(l.amount)                           AS total_loan_amount
-FROM   loans l
-LEFT JOIN payments p
-       ON p.loan_id = l.id AND p.payment_date IS NOT NULL
+    COALESCE(SUM(p.interest), 0.0) AS total_interest_received,
+    SUM(l.amount)                  AS total_loan_amount
+FROM   loan l
+LEFT JOIN payment p ON p.loan_id = l.id
 WHERE  l.client_id = %s
-  AND  l.issued_at >= NOW() - INTERVAL '90 days'
+  AND  l.created_on >= CURRENT_DATE - INTERVAL '90 days'
 ```
 
 Rate = `total_interest_received / total_loan_amount`.
 
 **Assumptions:**
-- "Issued in the last 90 days" means `loan.issued_at >= NOW() − 90 days`.
-- "Interest payment received" means a payment row where `payment_date IS NOT
-  NULL` (cash has actually arrived). Scheduled but unpaid instalments are
-  excluded.
-- Returns `None` when the client has no loans issued in the last 90 days
-  (feature is undefined, not zero – important for model training).
-- Returns `0.0` when loans exist in the window but no payments have been
-  received yet (denominator > 0, numerator = 0 – perfectly valid ratio).
-- Returns `None` if `sum(loan.amount) = 0` to guard against division by zero
-  (data quality edge case).
+- "Issued in last 90 days" = `loan.created_on >= TODAY − 90 days`.
+- "Interest received" = `payment.interest` for payments linked to those loans.
+- Returns `None` when no loans were issued in the last 90 days (feature is
+  undefined, not zero — important for model training).
+- Returns `0.0` when loans exist in the window but no payments yet.
+- Returns `None` if `SUM(loan.amount) = 0` (division-by-zero guard).
+- **Note:** the test dataset covers 2019–2020; running today (2026+) means this
+  feature returns `None` for all clients.  This is correct — the feature
+  is genuinely unavailable for historical data outside the rolling window.
 
-### Seed data edge cases covered
+---
 
-| Client | paid_loans | days_since_late | profit_rate_90d |
-|--------|-----------|-----------------|-----------------|
-| Alice  | 2         | ~30             | `15.34 / 800` ≈ 0.019 |
-| Bob    | 0         | None            | None (loan outside window) |
-| Carol  | 1         | ~200            | None (no loans in window) |
-| David  | 0         | None            | None (no loans at all) |
-| Eve    | 0         | None            | 0.0 (loan in window, no payment yet) |
+## CDC watermark columns
+
+| Table | Change-detection column | Granularity |
+|-------|------------------------|-------------|
+| `user` | `created_on` | Day (inserts only) |
+| `loan` | `updated_on` | Day (inserts + updates) |
+| `payment` | `created_on` | Day (inserts only) |
+
+Watermarks are stored in `/app/state/watermarks.json` (Docker volume) and
+survive container restarts.
 
 ---
 
@@ -216,23 +222,22 @@ Rate = `total_interest_received / total_loan_amount`.
 ```
 creditstar-features/
 ├── raw/
-│   ├── clients/year=…/month=…/day=…/<time>_<n>.parquet
-│   ├── loan_applications/…
-│   ├── loans/…
-│   └── payments/…
+│   ├── user/year=…/month=…/day=…/<time>_<n>.parquet
+│   ├── loan/…
+│   └── payment/…
 └── features/
     └── client_features/year=…/month=…/day=…/<time>_<n>.parquet
 ```
 
-Each Parquet file for `client_features` contains:
+`client_features` Parquet schema:
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `client_id` | int | |
-| `paid_loans_count` | int | |
-| `days_since_last_late_payment` | float / null | |
-| `profit_in_last_90_days_rate` | float / null | |
-| `computed_at` | ISO-8601 string | UTC timestamp of computation |
+| `paid_loans_count` | int | 0 if no paid loans |
+| `days_since_last_late_payment` | float / null | null = no late payment on record |
+| `profit_in_last_90_days_rate` | float / null | null = no loans in window |
+| `computed_at` | ISO-8601 string | UTC timestamp |
 
 ---
 
@@ -242,7 +247,7 @@ Each Parquet file for `client_features` contains:
 |----------|---------|-------------|
 | `POSTGRES_HOST` | `localhost` | |
 | `POSTGRES_PORT` | `5432` | |
-| `POSTGRES_DB` | `creditstar` | |
+| `POSTGRES_DB` | `de_test_materials` | |
 | `POSTGRES_USER` | `postgres` | |
 | `POSTGRES_PASSWORD` | `postgres` | |
 | `MINIO_ENDPOINT` | `localhost:9000` | |
