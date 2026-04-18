@@ -143,6 +143,26 @@ def run_cycle(watermarks: dict) -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _ensure_pipeline_setup() -> None:
+    """Create pipeline_watermarks if the post-restore SQL didn't run."""
+    with get_cursor() as (cur, conn):
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pipeline_watermarks (
+                table_name          VARCHAR(100) PRIMARY KEY,
+                last_processed_date DATE NOT NULL DEFAULT '1970-01-01'
+            )
+            """
+        )
+        for table, _ in TRACKED_TABLES:
+            cur.execute(
+                "INSERT INTO pipeline_watermarks (table_name) VALUES (%s) ON CONFLICT DO NOTHING",
+                (table,),
+            )
+        conn.commit()
+    logger.info("Pipeline DB setup verified.")
+
+
 def run() -> None:
     logging.basicConfig(
         level=getattr(logging, config.log_level, logging.INFO),
@@ -150,6 +170,7 @@ def run() -> None:
     )
     logger.info("Pipeline started – poll interval %ds", config.poll_interval_seconds)
 
+    _ensure_pipeline_setup()
     watermarks = _load_watermarks()
 
     while True:

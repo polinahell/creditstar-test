@@ -19,7 +19,7 @@ services:
         -c max_replication_slots=4
         -c max_wal_senders=4
     healthcheck:
-      test: ["CMD-SHELL", "psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-de_test_materials} -c 'SELECT 1 FROM pipeline_watermarks LIMIT 1' > /dev/null 2>&1"]
+      test: ["CMD-SHELL", "psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-de_test_materials} -c 'SELECT 1 FROM loan LIMIT 1' > /dev/null 2>&1"]
       interval: 15s
       timeout: 10s
       retries: 20
