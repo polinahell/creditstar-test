@@ -171,7 +171,7 @@ def run() -> None:
     logger.info("Pipeline started – poll interval %ds", config.poll_interval_seconds)
 
     # Wait for DB with exponential backoff before entering the main loop.
-    for attempt in range(1, 13):
+    for attempt in range(1, 51):
         try:
             _ensure_pipeline_setup()
             break

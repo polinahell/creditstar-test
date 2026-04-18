@@ -59,9 +59,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
       minio:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - pipeline_state:/app/state
     restart: on-failure
