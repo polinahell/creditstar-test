@@ -20,15 +20,19 @@ class StorageClient:
             secret_key=config.minio_secret_key,
             secure=config.minio_secure,
         )
-        self._ensure_bucket()
+        self._bucket_ready = False
 
     def _ensure_bucket(self) -> None:
+        if self._bucket_ready:
+            return
         if not self._client.bucket_exists(config.minio_bucket):
             self._client.make_bucket(config.minio_bucket)
             logger.info("Created bucket: %s", config.minio_bucket)
+        self._bucket_ready = True
 
     def write_parquet(self, df: pd.DataFrame, object_path: str) -> None:
         """Serialise *df* to Parquet and upload to MinIO."""
+        self._ensure_bucket()
         buf = io.BytesIO()
         df.to_parquet(buf, engine="pyarrow", index=False)
         buf.seek(0)
