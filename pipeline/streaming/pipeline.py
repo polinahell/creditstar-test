@@ -170,7 +170,19 @@ def run() -> None:
     )
     logger.info("Pipeline started – poll interval %ds", config.poll_interval_seconds)
 
-    _ensure_pipeline_setup()
+    # Wait for DB with exponential backoff before entering the main loop.
+    for attempt in range(1, 13):
+        try:
+            _ensure_pipeline_setup()
+            break
+        except Exception as e:
+            wait = min(attempt * 5, 60)
+            logger.warning("DB not ready (attempt %d): %s – retrying in %ds", attempt, e, wait)
+            time.sleep(wait)
+    else:
+        logger.error("Could not connect to DB after 12 attempts – exiting")
+        raise SystemExit(1)
+
     watermarks = _load_watermarks()
 
     while True:
