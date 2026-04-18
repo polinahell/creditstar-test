@@ -1,10 +1,4 @@
-# Creditstar Data Engineer Test – Streaming Feature Pipeline
-
-A near-real-time pipeline that detects changed rows in a PostgreSQL CRM
-replica (`de_test_materials`), computes client-level features, and writes raw
-data + features to MinIO (S3-compatible object storage) as Parquet files.
-
----
+# Creditstar Data Engineer Test Task
 
 ## Quick start
 
@@ -21,11 +15,7 @@ docker compose up --build
 # 4. Watch pipeline logs
 docker compose logs -f pipeline
 
-# 5. (Optional) inject live changes and watch the pipeline react
-docker compose exec pipeline python scripts/simulate_changes.py
-```
-
-**MinIO console** → http://localhost:9001 (minioadmin / minioadmin)  
+  
 **PostgreSQL**    → localhost:5432 / de_test_materials / postgres
 
 ---
@@ -37,8 +27,6 @@ cd pipeline
 pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
-
-All 13 tests pass without a live database (mocked cursors).
 
 ---
 
@@ -73,8 +61,6 @@ All 13 tests pass without a live database (mocked cursors).
 
 ## Sub Task 1 – Infrastructure
 
-### What I chose
-
 | Component | Choice | Reason |
 |-----------|--------|--------|
 | Source DB | PostgreSQL 15 + dump restore | The provided dump targets PostgreSQL |
@@ -85,7 +71,6 @@ All 13 tests pass without a live database (mocked cursors).
 
 ### Trade-offs considered
 
-**Polling vs Debezium**  
 The CRM schema uses DATE columns (`updated_on`, `created_on`) for tracking
 changes — day-level granularity.  Polling on these columns is simple and
 requires no schema migration.  A sub-second CDC solution (Debezium reading
@@ -108,17 +93,10 @@ production is a one-line env-var change (`MINIO_ENDPOINT=s3.amazonaws.com`).
 ### With more time / budget
 
 1. **Add TIMESTAMPTZ `updated_at` columns** – migrate `loan`, `payment`, `user`
-   to use proper timestamps so sub-minute CDC becomes possible.
+   to use proper timestamps.
 
-2. **Debezium + Kafka** – true WAL-based CDC; captures every row change
+2. **Debezium + Kafka** – captures every row change
    including hard deletes, sub-second latency, replayable event log.
-
-3. **Schema Registry (Avro/Protobuf)** – enforce schema evolution contracts
-   between producer and consumers.
-
-4. **Feature store** (Feast / Hopsworks) – replace raw Parquet with a
-   point-in-time correct feature store so the decision engine can do
-   low-latency lookups during scoring.
 
 5. **Airflow / Prefect** – replace the `while True` loop with a DAG that
    provides retry logic, SLA alerting, and backfill.
@@ -129,7 +107,7 @@ production is a one-line env-var change (`MINIO_ENDPOINT=s3.amazonaws.com`).
 
 All logic is in `pipeline/features/client_features.py`.
 
-### Real database schema (de_test_materials)
+### Real database schema
 
 | Table | Key columns |
 |-------|-------------|
@@ -146,10 +124,6 @@ SELECT COUNT(*) FROM loan
 WHERE client_id = %s AND status = 'paid'
 ```
 
-**Assumptions:**
-- Only `status = 'paid'` is counted.  `'overdue'` and `'application'` are excluded.
-- Returns `0` for clients with no paid loans.
-
 ---
 
 ### `client.days_since_last_late_payment.count`
@@ -165,15 +139,6 @@ WHERE  client_id = %s
 ```
 
 Days = `TODAY (UTC) − last_late_date`.
-
-**Assumptions:**
-- The `payment` table is empty in this dump; late-payment information is
-  inferred from the `loan` table.
-- "Late" = loan went overdue (`status = 'overdue'`) OR loan was paid after
-  its maturity date (`status = 'paid' AND updated_on > matured_on`).
-- `loan.updated_on` is used as the event date (last status change).
-- Returns `None` when the client has no overdue or late-paid loans on record.
-  Downstream consumers should treat `None` as "no late payment ever", not zero.
 
 ---
 
