@@ -7,18 +7,13 @@ user    – change detection via created_on (inserts only; no updated_on)
 loan    – change detection via updated_on  (inserts + status updates)
 payment – change detection via created_on  (inserts only; no updated_on)
 
-All date columns are DATE (not TIMESTAMPTZ), so the polling granularity is
-one day.  With more time we would add a proper TIMESTAMPTZ updated_at column
-via a migration, and wire up Debezium for sub-second CDC.
-
-IMPORTANT: 'user' is a reserved word in PostgreSQL – always double-quote it.
+Watermarks are stored in the pipeline_watermarks table in PostgreSQL so they
+survive container restarts without relying on a Docker volume mount.
 """
 
-import json
 import logging
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -37,25 +32,35 @@ TRACKED_TABLES = [
     ("payment", "created_on"),
 ]
 
-_STATE_PATH = Path("/app/state/watermarks.json")
-
 
 # ---------------------------------------------------------------------------
-# Watermark helpers
+# Watermark helpers (DB-backed)
 # ---------------------------------------------------------------------------
 
-def _load_watermarks() -> dict:
-    if _STATE_PATH.exists():
-        with _STATE_PATH.open() as f:
-            return json.load(f)
-    # Epoch date → first run performs a full initial load.
-    return {t: "1970-01-01" for t, _ in TRACKED_TABLES}
+def _load_watermarks(cur) -> dict:
+    cur.execute(
+        "SELECT table_name, last_processed_date::text FROM pipeline_watermarks"
+    )
+    rows = cur.fetchall()
+    wm = {r["table_name"]: str(r["last_processed_date"]) for r in rows}
+    for t, _ in TRACKED_TABLES:
+        wm.setdefault(t, "1970-01-01")
+    logger.debug("Watermarks loaded: %s", wm)
+    return wm
 
 
-def _save_watermarks(wm: dict) -> None:
-    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _STATE_PATH.open("w") as f:
-        json.dump(wm, f, indent=2)
+def _save_watermarks(wm: dict, cur) -> None:
+    for table, date in wm.items():
+        cur.execute(
+            """
+            INSERT INTO pipeline_watermarks (table_name, last_processed_date)
+            VALUES (%s, %s::date)
+            ON CONFLICT (table_name) DO UPDATE
+            SET last_processed_date = EXCLUDED.last_processed_date
+            """,
+            (table, date),
+        )
+    logger.debug("Watermarks saved: %s", wm)
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +114,13 @@ def _collect_affected_client_ids(table: str, date_col: str, since: str, cur) -> 
 # Main cycle
 # ---------------------------------------------------------------------------
 
-def run_cycle(watermarks: dict) -> dict:
+def run_cycle() -> None:
     cycle_date = datetime.now(timezone.utc).date().isoformat()
     affected: set = set()
 
     with get_cursor() as (cur, _conn):
+        watermarks = _load_watermarks(cur)
+
         for table, date_col in TRACKED_TABLES:
             since = watermarks[table]
 
@@ -136,7 +143,8 @@ def run_cycle(watermarks: dict) -> dict:
                 path = storage.dated_path("features/client_features", f"n{len(records)}")
                 storage.write_parquet(df_feat, path)
 
-    return new_watermarks
+        _save_watermarks(new_watermarks, cur)
+        # get_cursor commits on clean exit
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +178,6 @@ def run() -> None:
     )
     logger.info("Pipeline started – poll interval %ds", config.poll_interval_seconds)
 
-    # Wait for DB with exponential backoff before entering the main loop.
     for attempt in range(1, 51):
         try:
             _ensure_pipeline_setup()
@@ -180,15 +187,12 @@ def run() -> None:
             logger.warning("DB not ready (attempt %d): %s – retrying in %ds", attempt, e, wait)
             time.sleep(wait)
     else:
-        logger.error("Could not connect to DB after 12 attempts – exiting")
+        logger.error("Could not connect to DB after 50 attempts – exiting")
         raise SystemExit(1)
-
-    watermarks = _load_watermarks()
 
     while True:
         try:
-            watermarks = run_cycle(watermarks)
-            _save_watermarks(watermarks)
+            run_cycle()
         except Exception:
             logger.exception("Cycle failed – will retry after poll interval")
 
