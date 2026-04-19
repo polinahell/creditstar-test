@@ -45,11 +45,11 @@ def _load_watermarks(cur) -> dict:
     wm = {r["table_name"]: str(r["last_processed_date"]) for r in rows}
     for t, _ in TRACKED_TABLES:
         wm.setdefault(t, "1970-01-01")
-    logger.debug("Watermarks loaded: %s", wm)
+    logger.info("Watermarks loaded: %s", wm)
     return wm
 
 
-def _save_watermarks(wm: dict, cur) -> None:
+def _save_watermarks(wm: dict, cur, conn) -> None:
     for table, date in wm.items():
         cur.execute(
             """
@@ -60,7 +60,8 @@ def _save_watermarks(wm: dict, cur) -> None:
             """,
             (table, date),
         )
-    logger.debug("Watermarks saved: %s", wm)
+    conn.commit()
+    logger.info("Watermarks advanced → %s", wm)
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +144,7 @@ def run_cycle() -> None:
                 path = storage.dated_path("features/client_features", f"n{len(records)}")
                 storage.write_parquet(df_feat, path)
 
-        _save_watermarks(new_watermarks, cur)
-        # get_cursor commits on clean exit
+        _save_watermarks(new_watermarks, cur, _conn)
 
 
 # ---------------------------------------------------------------------------
